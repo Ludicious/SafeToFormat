@@ -48,7 +48,8 @@ It also handles a gotcha that breaks most quick scripts: **CFexpress and many CF
    ```
 3. Save it somewhere permanent.
 4. Right-click the file → **Properties** → tick **Unblock** at the bottom → **OK**.
-   *(Windows blocks downloaded scripts until you do this. Once only.)*
+   Do the same for `Run SafeToFormat.bat` if you'll use the double-click launcher.
+   *(Windows blocks downloaded files until you do this. Once only.)*
 
 ### Folder layout
 
@@ -67,7 +68,9 @@ If you don't organize by year, point `$FootageRoot` straight at the folder that 
 
 ## Running it
 
-In the folder, hold **Shift + right-click → "Open PowerShell window here"**, then:
+**Easiest — double-click.** Run `Run SafeToFormat.bat`. It launches the script from the same folder and keeps the window open so you can read the results. Keep the `.bat` and `.ps1` together.
+
+**From PowerShell.** In the folder, hold **Shift + right-click → "Open PowerShell window here"**, then:
 
 ```powershell
 .\SafeToFormat.ps1
