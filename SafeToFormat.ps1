@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
 ================================================================================
-  SafeToFormat.ps1
+  SafeToFormat.ps1  -  Version 1.1
   Know your camera cards are backed up before you wipe them.
 ================================================================================
 
@@ -10,8 +10,8 @@
       Windows reports as "fixed disks", which trips up most simple scripts).
     - Scans your backup folder and ALL its subfolders to see what's already there.
     - Tells you, card by card, whether every video file is backed up.
-    - Offers to COPY anything missing into a new dated folder, prompting you for
-      the date and a location/name so it lands in a tidy structure.
+    - Offers to COPY anything missing, grouped by the date each file was shot,
+      into separate dated folders - confirming each date and asking you to name it.
     - Verifies every copy with a SHA-256 hash before it ever calls a card safe.
     - Offers to safely eject each card that passed.
 
@@ -81,6 +81,9 @@ $FootageRoot = 'D:\Footage'              # <-- CHANGE THIS to your backup root
 #    Add to this list if you also back up stills/RAW (e.g. '.nef','.dng','.jpg').
 $MediaExtensions = @(
     '.mov','.mp4'                        # <-- ADD types here if you want more checked
+    # ,'.mxf','.mts','.m2ts','.m4v','.avi'   # other common video containers
+    # ,'.braw','.r3d','.ari'                  # cinema camera raw (BRAW, RED, ARRI)
+    # ,'.nef','.cr3','.dng','.jpg','.heic'    # stills / RAW
 )
 
 # ==============================================================================
@@ -89,57 +92,24 @@ $MediaExtensions = @(
 
 $ErrorActionPreference = 'Stop'
 
-# --- Copy helper: prompt for a dated/named folder and copy + verify -----------
-function Copy-CardFiles {
+# --- Copies one set of files into a target folder, verifying each by hash -----
+function Copy-FileSet {
     param(
         [System.IO.FileInfo[]]$Files,
-        [string]$DestRoot
+        [string]$Target
     )
-
-    # Folder date - defaults to today, must be YYYY-MM-DD
-    $today = (Get-Date).ToString('yyyy-MM-dd')
-    do {
-        $dateIn = Read-Host ("  Folder date (YYYY-MM-DD) [default {0}]" -f $today)
-        if (-not $dateIn) { $dateIn = $today }
-        $okDate = $dateIn -match '^\d{4}-\d{2}-\d{2}$'
-        if (-not $okDate) { Write-Host "  Use the format YYYY-MM-DD." -ForegroundColor Yellow }
-    } until ($okDate)
-
-    # Location / activity name - required, free text
-    do {
-        $loc = (Read-Host "  Location / name for this folder").Trim()
-        if (-not $loc) { Write-Host "  A name is required." -ForegroundColor Yellow }
-    } until ($loc)
-
-    # Strip characters Windows won't allow in a folder name
-    $invalid = [System.IO.Path]::GetInvalidFileNameChars()
-    $clean   = -join ($loc.ToCharArray() | ForEach-Object { if ($invalid -contains $_) { '-' } else { $_ } })
-
-    # FOLDER NAME PATTERN: "YYYY-MM-DD - Name". Edit the next line to change it.
-    $folder  = '{0} - {1}' -f $dateIn, $clean.Trim()
-
-    $target  = Join-Path $DestRoot $folder
-
-    Write-Host ("  Target folder: {0}" -f $target) -ForegroundColor Cyan
-    $go = Read-Host "  Copy now? (y/n)"
-    if ($go -notmatch '^(y|yes)$') {
-        Write-Host "  Copy cancelled." -ForegroundColor Yellow
-        return $false
+    if (-not (Test-Path -LiteralPath $Target)) {
+        New-Item -ItemType Directory -Path $Target -Force | Out-Null
     }
-
-    if (-not (Test-Path -LiteralPath $target)) {
-        New-Item -ItemType Directory -Path $target -Force | Out-Null
-    }
-
     $copied = 0; $failed = 0
     foreach ($f in $Files) {
-        $destFile = Join-Path $target $f.Name
+        $destFile = Join-Path $Target $f.Name
         # Never overwrite - if the name already exists, append _1, _2, ...
         if (Test-Path -LiteralPath $destFile) {
             $base = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
             $ext  = $f.Extension
             $n = 1
-            do { $destFile = Join-Path $target ('{0}_{1}{2}' -f $base, $n, $ext); $n++ } while (Test-Path -LiteralPath $destFile)
+            do { $destFile = Join-Path $Target ('{0}_{1}{2}' -f $base, $n, $ext); $n++ } while (Test-Path -LiteralPath $destFile)
         }
         try {
             Copy-Item -LiteralPath $f.FullName -Destination $destFile -ErrorAction Stop
@@ -149,6 +119,10 @@ function Copy-CardFiles {
             if ($srcHash -eq $dstHash) {
                 $copied++
                 Write-Host ("    copied + verified: {0}" -f $f.Name) -ForegroundColor Green
+                # Update the in-memory index so later cards in this run see this file
+                $key = '{0}|{1}' -f (Split-Path $destFile -Leaf).ToLower(), (Get-Item -LiteralPath $destFile).Length
+                if (-not $script:index.ContainsKey($key)) { $script:index[$key] = New-Object System.Collections.Generic.List[string] }
+                $script:index[$key].Add($destFile)
             }
             else {
                 $failed++
@@ -160,9 +134,65 @@ function Copy-CardFiles {
             Write-Host ("    FAILED: {0} - {1}" -f $f.Name, $_.Exception.Message) -ForegroundColor Red
         }
     }
-
     Write-Host ("  Copied {0} of {1} file(s)." -f $copied, $Files.Count) -ForegroundColor $(if ($failed) { 'Yellow' } else { 'Green' })
     return ($failed -eq 0 -and $copied -eq $Files.Count)
+}
+
+# --- Groups uncopied files by shoot date, then prompts + copies per date ------
+function Copy-CardFiles {
+    param(
+        [System.IO.FileInfo[]]$Files,
+        [string]$DestRoot
+    )
+
+    # Group by the file's modified date - the moment the camera finished writing
+    # it, which is the shoot date you see in Explorer's "Date" column. Oldest first.
+    $groups = @($Files | Group-Object { $_.LastWriteTime.ToString('yyyy-MM-dd') } | Sort-Object Name)
+
+    if ($groups.Count -gt 1) {
+        Write-Host ("  This card has footage from {0} different dates - I'll take them one at a time." -f $groups.Count) -ForegroundColor Cyan
+    }
+
+    $allOk = $true
+    foreach ($g in $groups) {
+        $groupFiles = @($g.Group)
+        $sample     = $groupFiles[0].LastWriteTime
+        $iso        = $sample.ToString('yyyy-MM-dd')
+        $friendly   = $sample.ToString('dddd, MMM d')
+
+        Write-Host ""
+        Write-Host ("  I see {0} file(s) dated {1} ({2})." -f $groupFiles.Count, $iso, $friendly) -ForegroundColor Cyan
+        $ans = Read-Host "  Is that date correct? (y/n)"
+        if ($ans -match '^(y|yes)$') {
+            $useDate = $iso
+        }
+        else {
+            do {
+                $useDate = (Read-Host "  Enter the correct date (YYYY-MM-DD)").Trim()
+                $parsed = [datetime]::MinValue
+                $okFmt = [datetime]::TryParseExact($useDate, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)
+                if (-not $okFmt) { Write-Host "  Use the format YYYY-MM-DD (e.g. 2026-06-04)." -ForegroundColor Yellow }
+            } until ($okFmt)
+        }
+
+        do {
+            $loc = (Read-Host "  Location / activity for this date").Trim()
+            if (-not $loc) { Write-Host "  A name is required." -ForegroundColor Yellow }
+        } until ($loc)
+
+        # Strip characters Windows won't allow in a folder name
+        $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+        $clean   = -join ($loc.ToCharArray() | ForEach-Object { if ($invalid -contains $_) { '-' } else { $_ } })
+
+        # FOLDER NAME PATTERN: "YYYY-MM-DD - Name". Edit the next line to change it.
+        $folder  = '{0} - {1}' -f $useDate, $clean.Trim()
+        $target  = Join-Path $DestRoot $folder
+
+        Write-Host ("  -> {0}" -f $target) -ForegroundColor Cyan
+        if (-not (Copy-FileSet -Files $groupFiles -Target $target)) { $allOk = $false }
+    }
+
+    return $allOk
 }
 
 # --- Resolve the destination folder -------------------------------------------
@@ -234,14 +264,14 @@ else {
 
 # --- Index the destination tree ONCE (filename+size -> list of full paths) ----
 Write-Host "`nIndexing $DestRoot (this can take a moment over a network)..." -ForegroundColor Cyan
-$index   = @{}
+$script:index = @{}
 $indexed = 0
 Get-ChildItem -LiteralPath $DestRoot -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
     $key = '{0}|{1}' -f $_.Name.ToLower(), $_.Length
-    if (-not $index.ContainsKey($key)) {
-        $index[$key] = New-Object System.Collections.Generic.List[string]
+    if (-not $script:index.ContainsKey($key)) {
+        $script:index[$key] = New-Object System.Collections.Generic.List[string]
     }
-    $index[$key].Add($_.FullName)
+    $script:index[$key].Add($_.FullName)
     $indexed++
 }
 Write-Host ("Indexed {0} files in the destination." -f $indexed)
@@ -264,7 +294,21 @@ foreach ($root in $cardRoots) {
         continue
     }
 
-    $cardFiles = @(Get-ChildItem -LiteralPath $root -File -Recurse -ErrorAction SilentlyContinue)
+    $scanErrors = @()
+    $cardFiles = @(Get-ChildItem -LiteralPath $root -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
+
+    $seriousErrors = @($scanErrors | Where-Object {
+        $p = "$($_.TargetObject)"
+        -not ($p -match 'System Volume Information' -or $p -match '\$RECYCLE\.BIN')
+    })
+    if ($seriousErrors.Count -gt 0) {
+        Write-Host ("  READ ERROR - {0} item(s) on this card could not be read." -f $seriousErrors.Count) -ForegroundColor White -BackgroundColor Red
+        Write-Host  "  The card may be failing or corrupt. DO NOT format it." -ForegroundColor Red
+        $seriousErrors | Select-Object -First 5 | ForEach-Object { Write-Host ("     {0}" -f $_.Exception.Message) -ForegroundColor Red }
+        $cardVerdicts.Add([pscustomobject]@{ Drive=$root; Verdict='READ ERROR - DO NOT FORMAT' })
+        continue
+    }
+
     if (-not $IncludeAll) {
         $cardFiles = @($cardFiles | Where-Object { $MediaExtensions -contains $_.Extension.ToLower() })
     }
@@ -281,10 +325,10 @@ foreach ($root in $cardRoots) {
         $key     = '{0}|{1}' -f $f.Name.ToLower(), $f.Length
         $status  = 'NOT COPIED'
         $foundAt = ''
-        if ($index.ContainsKey($key)) {
+        if ($script:index.ContainsKey($key)) {
             if ($Verify) {
                 $srcHash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
-                foreach ($dest in $index[$key]) {
+                foreach ($dest in $script:index[$key]) {
                     if ((Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash -eq $srcHash) {
                         $status = 'OK'; $foundAt = $dest; break
                     }
@@ -292,7 +336,7 @@ foreach ($root in $cardRoots) {
                 if ($status -ne 'OK') { $status = 'CONTENT DIFFERS' }
             }
             else {
-                $status = 'OK'; $foundAt = $index[$key][0]
+                $status = 'OK'; $foundAt = $script:index[$key][0]
             }
         }
         if ($status -eq 'NOT COPIED') { $toCopy.Add($f) }
@@ -321,6 +365,9 @@ foreach ($root in $cardRoots) {
 
     if ($problems -eq 0) {
         Write-Host "  ALL FILES BACKED UP - safe to format this card.  " -ForegroundColor Black -BackgroundColor Green
+        if (-not $Verify) {
+            Write-Host "  (matched by name + size; run with -Verify for byte-level certainty)" -ForegroundColor DarkGray
+        }
         $verdict = 'SAFE TO FORMAT'
     }
     else {
@@ -362,7 +409,7 @@ Write-Host " SUMMARY" -ForegroundColor Cyan
 Write-Host ('=' * 64)
 foreach ($v in $cardVerdicts) {
     $color = if ($v.Verdict -eq 'SAFE TO FORMAT') { 'Green' }
-             elseif ($v.Verdict -like '*NOT BACKED UP*') { 'Red' }
+             elseif ($v.Verdict -like '*NOT BACKED UP*' -or $v.Verdict -like '*DO NOT FORMAT*') { 'Red' }
              else { 'Yellow' }
     Write-Host ("   {0,-8}  {1}" -f $v.Drive, $v.Verdict) -ForegroundColor $color
 }

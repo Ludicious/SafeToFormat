@@ -23,6 +23,7 @@ It also handles a gotcha that breaks most quick scripts: **CFexpress and many CF
 - Detects every card plugged in — removable **and** fixed-disk readers (CFexpress/CF).
 - Scans your backup folder and **all** its subfolders to see what's already there.
 - Reports each card: backed up, or not — and lists exactly which files are missing.
+- **Guards against failing cards**: if any files on a card can't be read during the scan, it flags the card `READ ERROR - DO NOT FORMAT` rather than silently skipping unreadable files and calling the card safe.
 - Offers to **copy** missing files into a new `YYYY-MM-DD - Name` folder, prompting for the date and location.
 - **Verifies every copy with a SHA-256 hash** before marking a card safe.
 - Only looks at the file types you choose (video by default) — thumbnails, proxies, and sidecars are ignored so they don't cause false alarms.
@@ -103,7 +104,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\SafeToFormat
 
 ## How matching works
 
-Files are matched by **filename + exact byte size**, which is fast and reliable for camera-original files. Two caveats worth knowing:
+By default, files are matched by **filename + exact byte size** — fast and reliable for camera-original files. When a card passes, a note reminds you that this match is name+size only; run with `-Verify` if you want byte-level certainty before formatting something irreplaceable. Two caveats worth knowing:
 
 - If your import process **renames** files, name-matching won't recognize them. SafeToFormat works best when your backup keeps the camera's original filenames.
 - In rare cases two different clips can share a name *and* a byte size by coincidence. Use `-Verify` when you want byte-level certainty before formatting something irreplaceable.
