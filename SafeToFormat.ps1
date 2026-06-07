@@ -1,17 +1,19 @@
 #requires -Version 5.1
 <#
 ================================================================================
-  SafeToFormat.ps1  -  Version 1.1
+  SafeToFormat.ps1  -  Version 1.2
   Know your camera cards are backed up before you wipe them.
 ================================================================================
 
   WHAT IT DOES
     - Detects every SD / CF / CFexpress card plugged in (including readers that
       Windows reports as "fixed disks", which trips up most simple scripts).
-    - Scans your backup folder and ALL its subfolders to see what's already there.
+    - Searches ALL year folders under your backup root (or the whole root when
+      $UseYearFolders is off) so footage from any year is found in one pass.
     - Tells you, card by card, whether every video file is backed up.
-    - Offers to COPY anything missing, grouped by the date each file was shot,
-      into separate dated folders - confirming each date and asking you to name it.
+    - Offers to COPY anything missing, routing each file into the year folder that
+      matches its shoot date (e.g. <FootageRoot>\2025\) - confirming each date
+      and asking you to name it.
     - Verifies every copy with a SHA-256 hash before it ever calls a card safe.
     - Offers to safely eject each card that passed.
 
@@ -32,11 +34,11 @@
       then just double-click it.
 
   HANDY OPTIONS
-    .\SafeToFormat.ps1                 Check every card found, current year folder
+    .\SafeToFormat.ps1                 Check every card, search all year folders
     .\SafeToFormat.ps1 -Drives E,F,G   Check only these drive letters
     .\SafeToFormat.ps1 -CardPath E:\   Check one specific drive or folder
     .\SafeToFormat.ps1 -Verify         Hash-verify existing copies too (slower, certain)
-    .\SafeToFormat.ps1 -Year 2025      Use a different year subfolder
+    .\SafeToFormat.ps1 -Year 2025      Narrow the search to the 2025 year folder only
     .\SafeToFormat.ps1 -NoCopy         Read-only check, don't offer to copy
     .\SafeToFormat.ps1 -NoEject        Don't offer to eject cards
     .\SafeToFormat.ps1 -ReportPath out.csv   Save a full CSV report
@@ -50,7 +52,7 @@
 param(
     [string[]]$Drives,                    # e.g. -Drives E,F,G  (limit to these letters)
     [string]$CardPath,                    # a single explicit path/folder to check
-    [int]$Year = (Get-Date).Year,         # defaults to the current year (rolls over automatically)
+    [int]$Year = 0,                       # 0 = search all years; pass e.g. -Year 2025 to narrow
     [string]$DestRoot,                    # full override of the destination folder
     [switch]$Verify,                      # also SHA-256 verify existing copies (slower, certain)
     [switch]$IncludeAll,                  # check ALL files, not just the media types below
@@ -60,22 +62,23 @@ param(
 )
 
 # ==============================================================================
-#  CONFIG  --  the two things you'll want to change for your own setup
+#  CONFIG  --  the things you'll want to change for your own setup
 # ==============================================================================
 
 # 1) WHERE YOUR FOOTAGE LIVES.
 #    Set this to the root folder you back up to: a NAS share, an external drive,
-#    a local folder, whatever. The script looks inside <FootageRoot>\<Year>\ and
-#    every subfolder beneath it.
+#    a local folder, whatever. The script indexes everything under this folder.
 #    Examples:  'S:\Footage'   |   '\\NAS\media\Footage'   |   'D:\Backups\Video'
 $FootageRoot = 'D:\Footage'              # <-- CHANGE THIS to your backup root
 
-#    NOTE on the year subfolder: by default the script checks <FootageRoot>\<Year>.
-#    If you DON'T organize by year, either point $FootageRoot straight at the
-#    folder that holds your dated folders and pass -Year matching that folder,
-#    or just run with -DestRoot "X:\whatever" to skip year handling entirely.
+# 2) YEAR FOLDER LAYOUT.
+#    Set $true if you organize footage as <FootageRoot>\<Year>\<dated folders>
+#    (e.g. D:\Footage\2026\2026-06-04 - Zion). The script will search all year
+#    folders and route new copies into the year folder matching each file's date.
+#    Set $false if your dated folders sit directly under $FootageRoot (no year level).
+$UseYearFolders = $true                  # <-- CHANGE THIS if you don't use year subfolders
 
-# 2) WHICH FILE TYPES COUNT.
+# 3) WHICH FILE TYPES COUNT.
 #    Only these extensions are checked and copied. Everything else (thumbnails,
 #    proxies, telemetry, sidecars) is ignored so it doesn't cause false alarms.
 #    Add to this list if you also back up stills/RAW (e.g. '.nef','.dng','.jpg').
@@ -142,7 +145,9 @@ function Copy-FileSet {
 function Copy-CardFiles {
     param(
         [System.IO.FileInfo[]]$Files,
-        [string]$DestRoot
+        [string]$CopyRoot,            # $FootageRoot - base for year-routed copies
+        [bool]$UseYears,              # $UseYearFolders - whether to route by year
+        [string]$ExplicitDest         # explicit -DestRoot value, or '' if not passed
     )
 
     # Group by the file's modified date - the moment the camera finished writing
@@ -184,9 +189,21 @@ function Copy-CardFiles {
         $invalid = [System.IO.Path]::GetInvalidFileNameChars()
         $clean   = -join ($loc.ToCharArray() | ForEach-Object { if ($invalid -contains $_) { '-' } else { $_ } })
 
+        # Route the copy to the right base folder:
+        #   explicit -DestRoot -> use it directly (no year routing)
+        #   $UseYearFolders on -> <FootageRoot>\<year from the confirmed date>
+        #   $UseYearFolders off -> <FootageRoot> itself
+        if ($ExplicitDest) {
+            $base = $ExplicitDest
+        } elseif ($UseYears) {
+            $base = Join-Path $CopyRoot $useDate.Substring(0, 4)
+        } else {
+            $base = $CopyRoot
+        }
+
         # FOLDER NAME PATTERN: "YYYY-MM-DD - Name". Edit the next line to change it.
         $folder  = '{0} - {1}' -f $useDate, $clean.Trim()
-        $target  = Join-Path $DestRoot $folder
+        $target  = Join-Path $base $folder
 
         Write-Host ("  -> {0}" -f $target) -ForegroundColor Cyan
         if (-not (Copy-FileSet -Files $groupFiles -Target $target)) { $allOk = $false }
@@ -195,12 +212,19 @@ function Copy-CardFiles {
     return $allOk
 }
 
-# --- Resolve the destination folder -------------------------------------------
-if (-not $DestRoot) {
-    $DestRoot = Join-Path $FootageRoot ("$Year")
+# --- Determine the search root (what to index) --------------------------------
+#     -DestRoot explicit  -> search only that folder
+#     -Year explicit      -> search <FootageRoot>\<Year> (narrow for speed)
+#     default             -> search all of $FootageRoot (finds every year)
+if ($DestRoot) {
+    $SearchRoot = $DestRoot
+} elseif ($Year -ne 0) {
+    $SearchRoot = Join-Path $FootageRoot "$Year"
+} else {
+    $SearchRoot = $FootageRoot
 }
-if (-not (Test-Path -LiteralPath $DestRoot)) {
-    Write-Host "Destination not found: $DestRoot" -ForegroundColor Red
+if (-not (Test-Path -LiteralPath $SearchRoot)) {
+    Write-Host "Search root not found: $SearchRoot" -ForegroundColor Red
     Write-Host "Edit `$FootageRoot in the CONFIG section, check -Year, or pass -DestRoot." -ForegroundColor Red
     [void](Read-Host "`nPress Enter to close")
     exit 1
@@ -209,7 +233,7 @@ if (-not (Test-Path -LiteralPath $DestRoot)) {
 # --- Decide which card roots to check -----------------------------------------
 $cardRoots = @()
 $sysDrive  = ($env:SystemDrive -replace '[^A-Za-z]','').ToUpper()
-$destDrive = ([System.IO.Path]::GetPathRoot($DestRoot) -replace '[^A-Za-z]','').ToUpper()
+$destDrive = ([System.IO.Path]::GetPathRoot($(if ($DestRoot) { $DestRoot } else { $FootageRoot })) -replace '[^A-Za-z]','').ToUpper()
 
 if ($CardPath) {
     # Explicit path always wins - scan it no matter how Windows classifies the drive
@@ -262,11 +286,11 @@ else {
     }
 }
 
-# --- Index the destination tree ONCE (filename+size -> list of full paths) ----
-Write-Host "`nIndexing $DestRoot (this can take a moment over a network)..." -ForegroundColor Cyan
+# --- Index the search root ONCE (filename+size -> list of full paths) ---------
+Write-Host "`nIndexing $SearchRoot (this can take a moment over a network)..." -ForegroundColor Cyan
 $script:index = @{}
 $indexed = 0
-Get-ChildItem -LiteralPath $DestRoot -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+Get-ChildItem -LiteralPath $SearchRoot -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
     $key = '{0}|{1}' -f $_.Name.ToLower(), $_.Length
     if (-not $script:index.ContainsKey($key)) {
         $script:index[$key] = New-Object System.Collections.Generic.List[string]
@@ -373,7 +397,7 @@ foreach ($root in $cardRoots) {
     else {
         Write-Host "  $problems FILE(S) NOT BACKED UP - DO NOT format this card.  " -ForegroundColor White -BackgroundColor Red
         if ($missing.Count) {
-            Write-Host "`n  Not found in $DestRoot :" -ForegroundColor Red
+            Write-Host "`n  Not found in $SearchRoot :" -ForegroundColor Red
             $missing | ForEach-Object { Write-Host ("     {0}" -f $_.CardPath) }
         }
         if ($diff.Count) {
@@ -387,7 +411,7 @@ foreach ($root in $cardRoots) {
             Write-Host ""
             $doCopy = Read-Host ("  Copy the {0} uncopied file(s) to a new folder? (y/n)" -f $toCopy.Count)
             if ($doCopy -match '^(y|yes)$') {
-                $allOk = Copy-CardFiles -Files $toCopy.ToArray() -DestRoot $DestRoot
+                $allOk = Copy-CardFiles -Files $toCopy.ToArray() -CopyRoot $FootageRoot -UseYears $UseYearFolders -ExplicitDest $DestRoot
                 if ($allOk -and $diff.Count -eq 0) {
                     Write-Host "`n  All files now backed up + verified - safe to format this card." -ForegroundColor Green
                     $verdict = 'SAFE TO FORMAT'

@@ -21,10 +21,10 @@ It also handles a gotcha that breaks most quick scripts: **CFexpress and many CF
 ## What it does
 
 - Detects every card plugged in — removable **and** fixed-disk readers (CFexpress/CF).
-- Scans your backup folder and **all** its subfolders to see what's already there.
+- Searches **all year folders** under your backup root in a single pass, so footage from any year is found automatically. Pass `-Year 2025` to narrow the search to one year for speed.
 - Reports each card: backed up, or not — and lists exactly which files are missing.
 - **Guards against failing cards**: if any files on a card can't be read during the scan, it flags the card `READ ERROR - DO NOT FORMAT` rather than silently skipping unreadable files and calling the card safe.
-- Offers to **copy** missing files into a new `YYYY-MM-DD - Name` folder, prompting for the date and location.
+- Offers to **copy** missing files into a `YYYY-MM-DD - Name` folder routed to the **year folder matching each file's shoot date** (e.g. `D:\Footage\2025\2025-06-04 - Zion`), prompting for the date and location.
 - **Verifies every copy with a SHA-256 hash** before marking a card safe.
 - Only looks at the file types you choose (video by default) — thumbnails, proxies, and sidecars are ignored so they don't cause false alarms.
 - Offers to safely eject each card that passed.
@@ -54,16 +54,22 @@ It also handles a gotcha that breaks most quick scripts: **CFexpress and many CF
 
 ### Folder layout
 
-By default the script looks inside `<FootageRoot>\<Year>\` and every subfolder beneath it, e.g.:
+The default layout has a year level between the backup root and the dated folders:
 
 ```
 D:\Footage\
+  2025\
+    2025-10-14 - Fall Colors\
   2026\
     2026-05-31 - Zion Narrows\
     2026-06-02 - Snow Canyon\
 ```
 
-If you don't organize by year, point `$FootageRoot` straight at the folder that holds your dated folders and run with `-DestRoot` (see options below).
+By default the script indexes **all year folders** under `$FootageRoot`, so a card with footage from both 2025 and 2026 is handled correctly in one run. Copies are routed to the year folder that matches each file's shoot date automatically. Pass `-Year 2026` to narrow the index to a single year (faster on large archives).
+
+**No year level?** Set `$UseYearFolders = $false` in the CONFIG section. The script will search and copy directly under `$FootageRoot`.
+
+You can also pass `-DestRoot "X:\path"` to point at an exact folder, bypassing year handling entirely.
 
 ---
 
@@ -93,11 +99,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\SafeToFormat
 | `-Drives E,F,G` | Check only these drive letters |
 | `-CardPath E:\` | Check one specific drive or folder |
 | `-Verify` | Also hash-verify files that are already backed up (slower, certain) |
-| `-Year 2025` | Use a different year subfolder |
+| `-Year 2025` | Narrow the search index to the 2025 year folder (faster on large archives) |
 | `-NoCopy` | Read-only check; don't offer to copy missing files |
 | `-NoEject` | Don't offer to eject cards |
 | `-IncludeAll` | Check every file, not just the configured media types |
-| `-DestRoot "X:\path"` | Point at an exact destination folder, skipping year handling |
+| `-DestRoot "X:\path"` | Search and copy into this exact folder, bypassing all year routing |
 | `-ReportPath out.csv` | Save a full CSV report of every file and its status |
 
 ---
