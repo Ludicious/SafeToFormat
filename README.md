@@ -28,7 +28,9 @@ It also handles a gotcha that breaks most quick scripts: **CFexpress and many CF
 - **Verifies every copy with a SHA-256 hash** before marking a card safe.
 - Only looks at the file types you choose (video by default) — thumbnails, proxies, and sidecars are ignored so they don't cause false alarms.
 - Offers to safely eject each card that passed.
+- **Loops automatically**: after each round it prompts you to insert the next card and press Enter to scan again. The backup index is built **once** per session, so only the first round walks the NAS — subsequent rounds are fast.
 - Optional `-Verify` mode re-hashes files that are *already* backed up, for total certainty.
+- `-NoLoop` disables the rescan prompt for single-shot or scripted use.
 
 ---
 
@@ -95,16 +97,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\SafeToFormat
 
 | Option | What it does |
 | --- | --- |
-| *(none)* | Check every card found, against the current year's folder |
+| *(none)* | Check cards in a loop (insert, scan, eject, repeat), all year folders |
 | `-Drives E,F,G` | Check only these drive letters |
 | `-CardPath E:\` | Check one specific drive or folder |
 | `-Verify` | Also hash-verify files that are already backed up (slower, certain) |
 | `-Year 2025` | Narrow the search index to the 2025 year folder (faster on large archives) |
 | `-NoCopy` | Read-only check; don't offer to copy missing files |
 | `-NoEject` | Don't offer to eject cards |
+| `-NoLoop` | Exit after one round instead of prompting to scan more cards |
 | `-IncludeAll` | Check every file, not just the configured media types |
 | `-DestRoot "X:\path"` | Search and copy into this exact folder, bypassing all year routing |
-| `-ReportPath out.csv` | Save a full CSV report of every file and its status |
+| `-ReportPath out.csv` | Save a full CSV report of every file and its status (all rounds combined) |
 
 ---
 

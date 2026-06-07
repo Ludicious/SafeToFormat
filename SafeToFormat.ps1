@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
 ================================================================================
-  SafeToFormat.ps1  -  Version 1.2
+  SafeToFormat.ps1  -  Version 1.3
   Know your camera cards are backed up before you wipe them.
 ================================================================================
 
@@ -16,6 +16,8 @@
       and asking you to name it.
     - Verifies every copy with a SHA-256 hash before it ever calls a card safe.
     - Offers to safely eject each card that passed.
+    - Loops: after ejecting, prompts you to insert the next card and scan again.
+      The backup index is built ONCE per session - only the first round is slow.
 
     It NEVER deletes or formats anything. It only reads, copies, and verifies.
     You do the formatting yourself, once you trust the green "SAFE TO FORMAT".
@@ -34,14 +36,15 @@
       then just double-click it.
 
   HANDY OPTIONS
-    .\SafeToFormat.ps1                 Check every card, search all year folders
+    .\SafeToFormat.ps1                 Check cards in a loop, search all year folders
     .\SafeToFormat.ps1 -Drives E,F,G   Check only these drive letters
     .\SafeToFormat.ps1 -CardPath E:\   Check one specific drive or folder
     .\SafeToFormat.ps1 -Verify         Hash-verify existing copies too (slower, certain)
     .\SafeToFormat.ps1 -Year 2025      Narrow the search to the 2025 year folder only
     .\SafeToFormat.ps1 -NoCopy         Read-only check, don't offer to copy
     .\SafeToFormat.ps1 -NoEject        Don't offer to eject cards
-    .\SafeToFormat.ps1 -ReportPath out.csv   Save a full CSV report
+    .\SafeToFormat.ps1 -NoLoop         Single-shot: exit after one round, no rescan prompt
+    .\SafeToFormat.ps1 -ReportPath out.csv   Save a full CSV report (all rounds)
 
   Built collaboratively with Claude. Free to use and adapt. No warranty - test it
   on a card you can afford to be wrong about before you trust it with the keepers.
@@ -58,7 +61,8 @@ param(
     [switch]$IncludeAll,                  # check ALL files, not just the media types below
     [switch]$NoEject,                     # skip the "eject this card?" prompts
     [switch]$NoCopy,                      # skip the "copy missing files?" prompts
-    [string]$ReportPath                   # optional .csv report path
+    [switch]$NoLoop,                      # exit after one round instead of prompting to scan more
+    [string]$ReportPath                   # optional .csv report path (covers all rounds)
 )
 
 # ==============================================================================
@@ -122,7 +126,7 @@ function Copy-FileSet {
             if ($srcHash -eq $dstHash) {
                 $copied++
                 Write-Host ("    copied + verified: {0}" -f $f.Name) -ForegroundColor Green
-                # Update the in-memory index so later cards in this run see this file
+                # Update the in-memory index so later cards in this session see this file
                 $key = '{0}|{1}' -f (Split-Path $destFile -Leaf).ToLower(), (Get-Item -LiteralPath $destFile).Length
                 if (-not $script:index.ContainsKey($key)) { $script:index[$key] = New-Object System.Collections.Generic.List[string] }
                 $script:index[$key].Add($destFile)
@@ -212,6 +216,65 @@ function Copy-CardFiles {
     return $allOk
 }
 
+# --- Returns the list of card root paths to scan this round -------------------
+function Get-CardRoots {
+    param(
+        [string[]]$Drives,
+        [string]$CardPath,
+        [string]$SysDrive,
+        [string]$DestDrive,
+        [bool]$IsFirstRound
+    )
+
+    if ($CardPath) {
+        # Explicit path always wins
+        return @($CardPath)
+    }
+    elseif ($Drives) {
+        # Explicit drive letters - rebuild each round so a repopulated reader is found
+        return @($Drives | ForEach-Object {
+            $l = ($_ -replace '[^A-Za-z]','').ToUpper()
+            if ($l) { $l + ':\' }
+        } | Where-Object { $_ })
+    }
+    else {
+        # Auto-detect removable (DriveType 2) AND fixed-disk readers (DriveType 3).
+        # Fixed disks only qualify if they contain a DCIM folder (camera card heuristic).
+        $disks = @(
+            Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
+                Where-Object { $_.DeviceID -and ($_.DriveType -eq 2 -or $_.DriveType -eq 3) }
+        )
+        $cards = @()
+        foreach ($d in $disks) {
+            $letter = ($d.DeviceID -replace '[^A-Za-z]','').ToUpper()
+            if ($letter -eq $SysDrive)  { continue }   # never the Windows drive
+            if ($letter -eq $DestDrive) { continue }   # never the backup destination
+            if ($d.DriveType -eq 3) {
+                if (-not (Test-Path -LiteralPath (Join-Path ($d.DeviceID + '\') 'DCIM'))) { continue }
+            }
+            $cards += $d
+        }
+
+        if ($cards.Count -eq 0) {
+            # On the first round only, offer a manual-entry fallback
+            if ($IsFirstRound) {
+                $manual = Read-Host 'No cards detected. Enter a card path (e.g. E:\) or leave blank to cancel'
+                if ($manual) { return @($manual) }
+            }
+            return @()
+        }
+
+        Write-Host "Card drives detected:" -ForegroundColor Cyan
+        foreach ($vol in $cards) {
+            $label = if ($vol.VolumeName) { $vol.VolumeName } else { '(no label)' }
+            $size  = if ($vol.Size) { '{0:N0} GB' -f ($vol.Size / 1GB) } else { '?' }
+            $kind  = if ($vol.DriveType -eq 2) { 'removable' } else { 'fixed/reader' }
+            Write-Host ("   {0}\  {1}  ({2}, {3})" -f $vol.DeviceID, $label, $size, $kind)
+        }
+        return @($cards | ForEach-Object { $_.DeviceID + '\' })
+    }
+}
+
 # --- Determine the search root (what to index) --------------------------------
 #     -DestRoot explicit  -> search only that folder
 #     -Year explicit      -> search <FootageRoot>\<Year> (narrow for speed)
@@ -230,63 +293,21 @@ if (-not (Test-Path -LiteralPath $SearchRoot)) {
     exit 1
 }
 
-# --- Decide which card roots to check -----------------------------------------
-$cardRoots = @()
+# --- Pre-flight: validate explicit -Drives before entering the loop -----------
+if ($Drives -and -not $CardPath) {
+    $validLetters = @($Drives | ForEach-Object { ($_ -replace '[^A-Za-z]','').ToUpper() } | Where-Object { $_ })
+    if ($validLetters.Count -eq 0) {
+        Write-Host "No valid drive letters in -Drives." -ForegroundColor Red
+        [void](Read-Host "`nPress Enter to close")
+        exit 1
+    }
+}
+
+# --- Constants reused by every detection round --------------------------------
 $sysDrive  = ($env:SystemDrive -replace '[^A-Za-z]','').ToUpper()
 $destDrive = ([System.IO.Path]::GetPathRoot($(if ($DestRoot) { $DestRoot } else { $FootageRoot })) -replace '[^A-Za-z]','').ToUpper()
 
-if ($CardPath) {
-    # Explicit path always wins - scan it no matter how Windows classifies the drive
-    $cardRoots = @($CardPath)
-}
-elseif ($Drives) {
-    # Explicitly named letters are trusted directly (works even for fixed-disk readers)
-    $cardRoots = @($Drives | ForEach-Object {
-        $l = ($_ -replace '[^A-Za-z]','').ToUpper()
-        if ($l) { $l + ':\' }
-    } | Where-Object { $_ })
-    if ($cardRoots.Count -eq 0) { Write-Host "No valid drive letters in -Drives." -ForegroundColor Red; exit 1 }
-}
-else {
-    # Auto-detect. Include removable (DriveType 2) AND fixed (DriveType 3) disks,
-    # because most CFexpress / CF card readers present the card as a FIXED disk.
-    # Guards: never the Windows drive, never the backup destination, and a fixed
-    # disk only counts as a card if it actually contains a DCIM folder (so internal
-    # SSDs are ignored). Removable disks are listed as-is.
-    $disks = @(
-        Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
-            Where-Object { $_.DeviceID -and ($_.DriveType -eq 2 -or $_.DriveType -eq 3) }
-    )
-
-    $cards = @()
-    foreach ($d in $disks) {
-        $letter = ($d.DeviceID -replace '[^A-Za-z]','').ToUpper()
-        if ($letter -eq $sysDrive)  { continue }   # never the Windows drive
-        if ($letter -eq $destDrive) { continue }   # never the backup destination
-        if ($d.DriveType -eq 3) {
-            # Fixed disk: only treat as a card if it looks like one
-            if (-not (Test-Path -LiteralPath (Join-Path ($d.DeviceID + '\') 'DCIM'))) { continue }
-        }
-        $cards += $d
-    }
-
-    if ($cards.Count -eq 0) {
-        $manual = Read-Host 'No cards detected. Enter a card path (e.g. E:\) or leave blank to cancel'
-        if ($manual) { $cardRoots = @($manual) } else { exit 0 }
-    }
-    else {
-        Write-Host "Card drives detected:" -ForegroundColor Cyan
-        foreach ($vol in $cards) {
-            $label = if ($vol.VolumeName) { $vol.VolumeName } else { '(no label)' }
-            $size  = if ($vol.Size) { '{0:N0} GB' -f ($vol.Size / 1GB) } else { '?' }
-            $kind  = if ($vol.DriveType -eq 2) { 'removable' } else { 'fixed/reader' }
-            Write-Host ("   {0}\  {1}  ({2}, {3})" -f $vol.DeviceID, $label, $size, $kind)
-        }
-        $cardRoots = @($cards | ForEach-Object { $_.DeviceID + '\' })
-    }
-}
-
-# --- Index the search root ONCE (filename+size -> list of full paths) ---------
+# --- Index the search root ONCE - reused for every card in the session --------
 Write-Host "`nIndexing $SearchRoot (this can take a moment over a network)..." -ForegroundColor Cyan
 $script:index = @{}
 $indexed = 0
@@ -301,187 +322,243 @@ Get-ChildItem -LiteralPath $SearchRoot -File -Recurse -ErrorAction SilentlyConti
 Write-Host ("Indexed {0} files in the destination." -f $indexed)
 if ($Verify) { Write-Host "Verify mode ON - SHA-256 checking existing copies (slow, certain)." -ForegroundColor Cyan }
 
-# --- Check each card root -----------------------------------------------------
-$allResults   = New-Object System.Collections.Generic.List[object]
-$cardVerdicts = New-Object System.Collections.Generic.List[object]
+# --- Session-wide accumulators ------------------------------------------------
+$sessionResults = New-Object System.Collections.Generic.List[object]
+$sessionCards   = 0
+$sessionSafe    = 0
+$sessionIssues  = 0
+$isFirstRound   = $true
 
-foreach ($root in $cardRoots) {
+# ==============================================================================
+#  SESSION LOOP  -  one round per batch of inserted cards
+# ==============================================================================
+while ($true) {
 
-    Write-Host ""
-    Write-Host ('=' * 64)
-    Write-Host (" CARD: {0}" -f $root) -ForegroundColor Cyan
-    Write-Host ('=' * 64)
+    # --- Detect cards for this round ------------------------------------------
+    $cardRoots = @(Get-CardRoots -Drives $Drives -CardPath $CardPath -SysDrive $sysDrive -DestDrive $destDrive -IsFirstRound $isFirstRound)
 
-    if (-not (Test-Path -LiteralPath $root)) {
-        Write-Host "  Path not found - skipping." -ForegroundColor Yellow
-        $cardVerdicts.Add([pscustomobject]@{ Drive=$root; Verdict='NOT FOUND' })
-        continue
-    }
-
-    $scanErrors = @()
-    $cardFiles = @(Get-ChildItem -LiteralPath $root -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
-
-    $seriousErrors = @($scanErrors | Where-Object {
-        $p = "$($_.TargetObject)"
-        -not ($p -match 'System Volume Information' -or $p -match '\$RECYCLE\.BIN')
-    })
-    if ($seriousErrors.Count -gt 0) {
-        Write-Host ("  READ ERROR - {0} item(s) on this card could not be read." -f $seriousErrors.Count) -ForegroundColor White -BackgroundColor Red
-        Write-Host  "  The card may be failing or corrupt. DO NOT format it." -ForegroundColor Red
-        $seriousErrors | Select-Object -First 5 | ForEach-Object { Write-Host ("     {0}" -f $_.Exception.Message) -ForegroundColor Red }
-        $cardVerdicts.Add([pscustomobject]@{ Drive=$root; Verdict='READ ERROR - DO NOT FORMAT' })
-        continue
-    }
-
-    if (-not $IncludeAll) {
-        $cardFiles = @($cardFiles | Where-Object { $MediaExtensions -contains $_.Extension.ToLower() })
-    }
-
-    if ($cardFiles.Count -eq 0) {
-        Write-Host "  No media files found - likely empty or device internal storage. Nothing to back up." -ForegroundColor Yellow
-        $cardVerdicts.Add([pscustomobject]@{ Drive=$root; Verdict='EMPTY / NO MEDIA' })
-        continue
-    }
-
-    $results = New-Object System.Collections.Generic.List[object]
-    $toCopy  = New-Object System.Collections.Generic.List[object]
-    foreach ($f in $cardFiles) {
-        $key     = '{0}|{1}' -f $f.Name.ToLower(), $f.Length
-        $status  = 'NOT COPIED'
-        $foundAt = ''
-        if ($script:index.ContainsKey($key)) {
-            if ($Verify) {
-                $srcHash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
-                foreach ($dest in $script:index[$key]) {
-                    if ((Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash -eq $srcHash) {
-                        $status = 'OK'; $foundAt = $dest; break
-                    }
-                }
-                if ($status -ne 'OK') { $status = 'CONTENT DIFFERS' }
-            }
-            else {
-                $status = 'OK'; $foundAt = $script:index[$key][0]
-            }
+    if ($cardRoots.Count -eq 0) {
+        if ($isFirstRound) {
+            # First round: user left manual-entry blank - nothing to do, exit cleanly
+            break
         }
-        if ($status -eq 'NOT COPIED') { $toCopy.Add($f) }
-        $row = [pscustomobject]@{
-            Drive    = $root
-            Status   = $status
-            File     = $f.Name
-            SizeMB   = [math]::Round($f.Length / 1MB, 1)
-            CardPath = $f.FullName
-            FoundAt  = $foundAt
-        }
-        $results.Add($row)
-        $allResults.Add($row)
-    }
-
-    $okCount  = @($results | Where-Object Status -eq 'OK').Count
-    $missing  = @($results | Where-Object Status -eq 'NOT COPIED')
-    $diff     = @($results | Where-Object Status -eq 'CONTENT DIFFERS')
-    $problems = $missing.Count + $diff.Count
-
-    Write-Host (" Media files: {0}   Backed up: {1}   NOT copied: {2}" -f $cardFiles.Count, $okCount, $missing.Count)
-    if ($Verify -and $diff.Count -gt 0) {
-        Write-Host (" Content differs: {0}" -f $diff.Count) -ForegroundColor Yellow
-    }
-    Write-Host ""
-
-    if ($problems -eq 0) {
-        Write-Host "  ALL FILES BACKED UP - safe to format this card.  " -ForegroundColor Black -BackgroundColor Green
-        if (-not $Verify) {
-            Write-Host "  (matched by name + size; run with -Verify for byte-level certainty)" -ForegroundColor DarkGray
-        }
-        $verdict = 'SAFE TO FORMAT'
+        Write-Host "  No cards detected." -ForegroundColor Yellow
     }
     else {
-        Write-Host "  $problems FILE(S) NOT BACKED UP - DO NOT format this card.  " -ForegroundColor White -BackgroundColor Red
-        if ($missing.Count) {
-            Write-Host "`n  Not found in $SearchRoot :" -ForegroundColor Red
-            $missing | ForEach-Object { Write-Host ("     {0}" -f $_.CardPath) }
-        }
-        if ($diff.Count) {
-            Write-Host "`n  Name+size matched but content differs (verify these!):" -ForegroundColor Yellow
-            $diff | ForEach-Object { Write-Host ("     {0}" -f $_.CardPath) }
-        }
-        $verdict = "$problems NOT BACKED UP"
+        # --- Check each card this round ---------------------------------------
+        $cardVerdicts = New-Object System.Collections.Generic.List[object]
 
-        # Offer to copy the uncopied files into a new dated/named folder
-        if (-not $NoCopy -and $toCopy.Count -gt 0) {
+        foreach ($root in $cardRoots) {
+
             Write-Host ""
-            $doCopy = Read-Host ("  Copy the {0} uncopied file(s) to a new folder? (y/n)" -f $toCopy.Count)
-            if ($doCopy -match '^(y|yes)$') {
-                $allOk = Copy-CardFiles -Files $toCopy.ToArray() -CopyRoot $FootageRoot -UseYears $UseYearFolders -ExplicitDest $DestRoot
-                if ($allOk -and $diff.Count -eq 0) {
-                    Write-Host "`n  All files now backed up + verified - safe to format this card." -ForegroundColor Green
-                    $verdict = 'SAFE TO FORMAT'
-                }
-                else {
-                    Write-Host "`n  Copy finished with issues - re-run the check before formatting." -ForegroundColor Yellow
-                    $verdict = 'COPY INCOMPLETE - RECHECK'
-                }
+            Write-Host ('=' * 64)
+            Write-Host (" CARD: {0}" -f $root) -ForegroundColor Cyan
+            Write-Host ('=' * 64)
+
+            if (-not (Test-Path -LiteralPath $root)) {
+                Write-Host "  Path not found - skipping." -ForegroundColor Yellow
+                $cardVerdicts.Add([pscustomobject]@{ Drive=$root; Verdict='NOT FOUND' })
+                continue
             }
-        }
-    }
-    $cardVerdicts.Add([pscustomobject]@{ Drive=$root; Verdict=$verdict })
-}
 
-# --- Combined summary ---------------------------------------------------------
-Write-Host ""
-Write-Host ('=' * 64)
-Write-Host " SUMMARY" -ForegroundColor Cyan
-Write-Host ('=' * 64)
-foreach ($v in $cardVerdicts) {
-    $color = if ($v.Verdict -eq 'SAFE TO FORMAT') { 'Green' }
-             elseif ($v.Verdict -like '*NOT BACKED UP*' -or $v.Verdict -like '*DO NOT FORMAT*') { 'Red' }
-             else { 'Yellow' }
-    Write-Host ("   {0,-8}  {1}" -f $v.Drive, $v.Verdict) -ForegroundColor $color
-}
+            $scanErrors = @()
+            $cardFiles = @(Get-ChildItem -LiteralPath $root -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable scanErrors)
 
-# --- Optional CSV -------------------------------------------------------------
-if ($ReportPath) {
-    $allResults | Export-Csv -LiteralPath $ReportPath -NoTypeInformation -Encoding UTF8
-    Write-Host "`nFull report saved to $ReportPath" -ForegroundColor Cyan
-}
+            $seriousErrors = @($scanErrors | Where-Object {
+                $p = "$($_.TargetObject)"
+                -not ($p -match 'System Volume Information' -or $p -match '\$RECYCLE\.BIN')
+            })
+            if ($seriousErrors.Count -gt 0) {
+                Write-Host ("  READ ERROR - {0} item(s) on this card could not be read." -f $seriousErrors.Count) -ForegroundColor White -BackgroundColor Red
+                Write-Host  "  The card may be failing or corrupt. DO NOT format it." -ForegroundColor Red
+                $seriousErrors | Select-Object -First 5 | ForEach-Object { Write-Host ("     {0}" -f $_.Exception.Message) -ForegroundColor Red }
+                $cardVerdicts.Add([pscustomobject]@{ Drive=$root; Verdict='READ ERROR - DO NOT FORMAT' })
+                continue
+            }
 
-# --- Offer to eject cards that passed -----------------------------------------
-if (-not $NoEject) {
-    $safe = @($cardVerdicts | Where-Object { $_.Verdict -eq 'SAFE TO FORMAT' })
-    if ($safe.Count -gt 0) {
-        Write-Host ""
-        foreach ($s in $safe) {
-            $rootDrive = [System.IO.Path]::GetPathRoot($s.Drive)        # e.g. "E:\"
-            $letter    = ($rootDrive -replace '[^A-Za-z]','').ToUpper()
-            if (-not $letter) { continue }
+            if (-not $IncludeAll) {
+                $cardFiles = @($cardFiles | Where-Object { $MediaExtensions -contains $_.Extension.ToLower() })
+            }
 
-            # Allow eject for removable drives and fixed-disk card readers,
-            # but never the Windows drive.
-            $sysLetter = ($env:SystemDrive -replace '[^A-Za-z]','').ToUpper()
-            if ($letter -eq $sysLetter) { continue }
-            $dt = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($letter):'" -ErrorAction SilentlyContinue).DriveType
-            if ($dt -ne 2 -and $dt -ne 3) { continue }
+            if ($cardFiles.Count -eq 0) {
+                Write-Host "  No media files found - likely empty or device internal storage. Nothing to back up." -ForegroundColor Yellow
+                $cardVerdicts.Add([pscustomobject]@{ Drive=$root; Verdict='EMPTY / NO MEDIA' })
+                continue
+            }
 
-            $ans = Read-Host ("Eject {0} now? (y/n)" -f $rootDrive)
-            if ($ans -match '^(y|yes)$') {
-                try {
-                    $shell = New-Object -ComObject Shell.Application
-                    $item  = $shell.Namespace(17).ParseName($rootDrive)
-                    if (-not $item) { $item = $shell.Namespace(17).ParseName(($letter + ':')) }
-                    if ($item) {
-                        $item.InvokeVerb('Eject')
-                        Start-Sleep -Milliseconds 700
-                        Write-Host ("  Ejected {0} - you can pull the card." -f $rootDrive) -ForegroundColor Green
+            $results = New-Object System.Collections.Generic.List[object]
+            $toCopy  = New-Object System.Collections.Generic.List[object]
+            foreach ($f in $cardFiles) {
+                $key     = '{0}|{1}' -f $f.Name.ToLower(), $f.Length
+                $status  = 'NOT COPIED'
+                $foundAt = ''
+                if ($script:index.ContainsKey($key)) {
+                    if ($Verify) {
+                        $srcHash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
+                        foreach ($dest in $script:index[$key]) {
+                            if ((Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash -eq $srcHash) {
+                                $status = 'OK'; $foundAt = $dest; break
+                            }
+                        }
+                        if ($status -ne 'OK') { $status = 'CONTENT DIFFERS' }
                     }
                     else {
-                        Write-Host ("  Couldn't grab {0} to eject - use the taskbar 'Safely Remove' icon, or just pull it (writes are done)." -f $rootDrive) -ForegroundColor Yellow
+                        $status = 'OK'; $foundAt = $script:index[$key][0]
                     }
                 }
-                catch {
-                    Write-Host ("  Couldn't eject {0} automatically ({1}). Some card readers can't be ejected this way - use the taskbar 'Safely Remove' icon." -f $rootDrive, $_.Exception.Message) -ForegroundColor Yellow
+                if ($status -eq 'NOT COPIED') { $toCopy.Add($f) }
+                $row = [pscustomobject]@{
+                    Drive    = $root
+                    Status   = $status
+                    File     = $f.Name
+                    SizeMB   = [math]::Round($f.Length / 1MB, 1)
+                    CardPath = $f.FullName
+                    FoundAt  = $foundAt
+                }
+                $results.Add($row)
+                $sessionResults.Add($row)
+            }
+
+            $okCount  = @($results | Where-Object Status -eq 'OK').Count
+            $missing  = @($results | Where-Object Status -eq 'NOT COPIED')
+            $diff     = @($results | Where-Object Status -eq 'CONTENT DIFFERS')
+            $problems = $missing.Count + $diff.Count
+
+            Write-Host (" Media files: {0}   Backed up: {1}   NOT copied: {2}" -f $cardFiles.Count, $okCount, $missing.Count)
+            if ($Verify -and $diff.Count -gt 0) {
+                Write-Host (" Content differs: {0}" -f $diff.Count) -ForegroundColor Yellow
+            }
+            Write-Host ""
+
+            if ($problems -eq 0) {
+                Write-Host "  ALL FILES BACKED UP - safe to format this card.  " -ForegroundColor Black -BackgroundColor Green
+                if (-not $Verify) {
+                    Write-Host "  (matched by name + size; run with -Verify for byte-level certainty)" -ForegroundColor DarkGray
+                }
+                $verdict = 'SAFE TO FORMAT'
+            }
+            else {
+                Write-Host "  $problems FILE(S) NOT BACKED UP - DO NOT format this card.  " -ForegroundColor White -BackgroundColor Red
+                if ($missing.Count) {
+                    Write-Host "`n  Not found in $SearchRoot :" -ForegroundColor Red
+                    $missing | ForEach-Object { Write-Host ("     {0}" -f $_.CardPath) }
+                }
+                if ($diff.Count) {
+                    Write-Host "`n  Name+size matched but content differs (verify these!):" -ForegroundColor Yellow
+                    $diff | ForEach-Object { Write-Host ("     {0}" -f $_.CardPath) }
+                }
+                $verdict = "$problems NOT BACKED UP"
+
+                # Offer to copy the uncopied files into a new dated/named folder
+                if (-not $NoCopy -and $toCopy.Count -gt 0) {
+                    Write-Host ""
+                    $doCopy = Read-Host ("  Copy the {0} uncopied file(s) to a new folder? (y/n)" -f $toCopy.Count)
+                    if ($doCopy -match '^(y|yes)$') {
+                        $allOk = Copy-CardFiles -Files $toCopy.ToArray() -CopyRoot $FootageRoot -UseYears $UseYearFolders -ExplicitDest $DestRoot
+                        if ($allOk -and $diff.Count -eq 0) {
+                            Write-Host "`n  All files now backed up + verified - safe to format this card." -ForegroundColor Green
+                            $verdict = 'SAFE TO FORMAT'
+                        }
+                        else {
+                            Write-Host "`n  Copy finished with issues - re-run the check before formatting." -ForegroundColor Yellow
+                            $verdict = 'COPY INCOMPLETE - RECHECK'
+                        }
+                    }
+                }
+            }
+            $cardVerdicts.Add([pscustomobject]@{ Drive=$root; Verdict=$verdict })
+        }
+
+        # --- Round summary ----------------------------------------------------
+        Write-Host ""
+        Write-Host ('=' * 64)
+        Write-Host " SUMMARY" -ForegroundColor Cyan
+        Write-Host ('=' * 64)
+        foreach ($v in $cardVerdicts) {
+            $color = if ($v.Verdict -eq 'SAFE TO FORMAT') { 'Green' }
+                     elseif ($v.Verdict -like '*NOT BACKED UP*' -or $v.Verdict -like '*DO NOT FORMAT*') { 'Red' }
+                     else { 'Yellow' }
+            Write-Host ("   {0,-8}  {1}" -f $v.Drive, $v.Verdict) -ForegroundColor $color
+        }
+
+        # Update session-wide counts
+        $sessionCards  += $cardVerdicts.Count
+        $sessionSafe   += @($cardVerdicts | Where-Object { $_.Verdict -eq 'SAFE TO FORMAT' }).Count
+        $sessionIssues += @($cardVerdicts | Where-Object {
+            $_.Verdict -like '*NOT BACKED UP*' -or
+            $_.Verdict -like '*DO NOT FORMAT*' -or
+            $_.Verdict -like '*RECHECK*'
+        }).Count
+
+        # --- Eject cards that passed this round -------------------------------
+        if (-not $NoEject) {
+            $safe = @($cardVerdicts | Where-Object { $_.Verdict -eq 'SAFE TO FORMAT' })
+            if ($safe.Count -gt 0) {
+                Write-Host ""
+                foreach ($s in $safe) {
+                    $rootDrive = [System.IO.Path]::GetPathRoot($s.Drive)        # e.g. "E:\"
+                    $letter    = ($rootDrive -replace '[^A-Za-z]','').ToUpper()
+                    if (-not $letter) { continue }
+
+                    # Allow eject for removable drives and fixed-disk card readers,
+                    # but never the Windows drive.
+                    $sysLetter = ($env:SystemDrive -replace '[^A-Za-z]','').ToUpper()
+                    if ($letter -eq $sysLetter) { continue }
+                    $dt = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($letter):'" -ErrorAction SilentlyContinue).DriveType
+                    if ($dt -ne 2 -and $dt -ne 3) { continue }
+
+                    $ans = Read-Host ("Eject {0} now? (y/n)" -f $rootDrive)
+                    if ($ans -match '^(y|yes)$') {
+                        try {
+                            $shell = New-Object -ComObject Shell.Application
+                            $item  = $shell.Namespace(17).ParseName($rootDrive)
+                            if (-not $item) { $item = $shell.Namespace(17).ParseName(($letter + ':')) }
+                            if ($item) {
+                                $item.InvokeVerb('Eject')
+                                Start-Sleep -Milliseconds 700
+                                Write-Host ("  Ejected {0} - you can pull the card." -f $rootDrive) -ForegroundColor Green
+                            }
+                            else {
+                                Write-Host ("  Couldn't grab {0} to eject - use the taskbar 'Safely Remove' icon, or just pull it (writes are done)." -f $rootDrive) -ForegroundColor Yellow
+                            }
+                        }
+                        catch {
+                            Write-Host ("  Couldn't eject {0} automatically ({1}). Some card readers can't be ejected this way - use the taskbar 'Safely Remove' icon." -f $rootDrive, $_.Exception.Message) -ForegroundColor Yellow
+                        }
+                    }
                 }
             }
         }
-    }
+    }   # end if cardRoots.Count -gt 0
+
+    $isFirstRound = $false
+
+    # -NoLoop: single-shot mode, skip the rescan prompt and exit
+    if ($NoLoop) { break }
+
+    # --- Rescan prompt --------------------------------------------------------
+    Write-Host ""
+    $again = (Read-Host "Scan more cards? Insert the next card(s), wait for them to mount, then press Enter to scan. Type q then Enter to finish.").Trim()
+    if ($again -match '^q') { break }
+    Write-Host "  Waiting for card to mount..." -ForegroundColor DarkGray
+    Start-Sleep -Seconds 2
+
+}   # end session loop
+
+# --- Session tally ------------------------------------------------------------
+if ($sessionCards -gt 0) {
+    Write-Host ""
+    Write-Host ('=' * 64)
+    Write-Host " SESSION COMPLETE" -ForegroundColor Cyan
+    Write-Host ('=' * 64)
+    $tallyColor = if ($sessionIssues -eq 0) { 'Green' } else { 'Yellow' }
+    Write-Host ("  {0} card(s) checked, {1} safe, {2} with issues." -f $sessionCards, $sessionSafe, $sessionIssues) -ForegroundColor $tallyColor
+}
+
+# --- Optional CSV (all rounds combined) ---------------------------------------
+if ($ReportPath) {
+    $sessionResults | Export-Csv -LiteralPath $ReportPath -NoTypeInformation -Encoding UTF8
+    Write-Host "`nFull report saved to $ReportPath" -ForegroundColor Cyan
 }
 
 [void](Read-Host "`nDone. Press Enter to close")
